@@ -1,0 +1,333 @@
+package httpapi
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"embed"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/qishuhua/hikvision-isapi-snapshot/internal/model"
+	"github.com/qishuhua/hikvision-isapi-snapshot/internal/service"
+)
+
+//go:embed web/*
+var web embed.FS
+
+type Handler struct {
+	svc                *service.Service
+	username, password string
+}
+
+func New(svc *service.Service, username, password string) http.Handler {
+	h := &Handler{svc: svc, username: username, password: password}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, 200, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" || r.Method != "GET" {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := web.ReadFile("web/index.html")
+		if err != nil {
+			http.Error(w, "UI missing", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
+	})
+	mux.Handle("/api/", h.auth(http.HandlerFunc(h.route)))
+	return mux
+}
+func (h *Handler) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		a := sha256.Sum256([]byte(u))
+		b := sha256.Sum256([]byte(h.username))
+		c := sha256.Sum256([]byte(p))
+		d := sha256.Sum256([]byte(h.password))
+		if !ok || subtle.ConstantTimeCompare(a[:], b[:]) != 1 || subtle.ConstantTimeCompare(c[:], d[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Snapshot Admin"`)
+			errorOut(w, 401, "authentication required")
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+func jsonOut(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+func errorOut(w http.ResponseWriter, status int, msg string) {
+	jsonOut(w, status, map[string]string{"error": msg})
+}
+func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		errorOut(w, 400, "invalid JSON: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		errorOut(w, 400, "expected one JSON object")
+		return false
+	}
+	return true
+}
+func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 2 || parts[0] != "api" {
+		http.NotFound(w, r)
+		return
+	}
+	switch parts[1] {
+	case "cameras":
+		h.cameras(w, r, parts[2:])
+	case "schedules":
+		h.schedules(w, r, parts[2:])
+	case "storage":
+		h.storage(w, r, parts[2:])
+	case "records":
+		if r.Method != "GET" {
+			errorOut(w, 405, "method not allowed")
+			return
+		}
+		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		jsonOut(w, 200, h.svc.DB.ListRecords(n))
+	case "capture":
+		h.directCapture(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+func (h *Handler) cameras(w http.ResponseWriter, r *http.Request, path []string) {
+	if len(path) == 0 {
+		switch r.Method {
+		case "GET":
+			jsonOut(w, 200, h.svc.DB.ListCameras())
+		case "POST":
+			var c model.Camera
+			if !decode(w, r, &c) {
+				return
+			}
+			c.ID = ""
+			newC, err := h.svc.DB.PutCamera(c)
+			if err != nil {
+				errorOut(w, 400, err.Error())
+				return
+			}
+			jsonOut(w, 201, newC)
+		default:
+			errorOut(w, 405, "method not allowed")
+		}
+		return
+	}
+	id := path[0]
+	if len(path) == 2 && path[1] == "capture" {
+		if r.Method != "POST" {
+			errorOut(w, 405, "method not allowed")
+			return
+		}
+		if _, ok := h.svc.DB.GetCamera(id); !ok {
+			errorOut(w, 404, "camera not found")
+			return
+		}
+		h.respondCapture(w, r, func(ctx context.Context) ([]byte, string, error) {
+			return h.svc.CaptureSaved(ctx, id, r.URL.Query().Get("upload") == "true", "manual", "")
+		})
+		return
+	}
+	if len(path) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case "GET":
+		c, ok := h.svc.DB.GetCamera(id)
+		if !ok {
+			errorOut(w, 404, "camera not found")
+			return
+		}
+		c.HasPassword = c.Password != ""
+		c.Password = ""
+		jsonOut(w, 200, c)
+	case "PUT":
+		if _, ok := h.svc.DB.GetCamera(id); !ok {
+			errorOut(w, 404, "camera not found")
+			return
+		}
+		var c model.Camera
+		if !decode(w, r, &c) {
+			return
+		}
+		c.ID = id
+		updated, err := h.svc.DB.PutCamera(c)
+		if err != nil {
+			errorOut(w, 400, err.Error())
+			return
+		}
+		jsonOut(w, 200, updated)
+	case "DELETE":
+		if err := h.svc.DB.DeleteCamera(id); err != nil {
+			errorOut(w, 404, "camera not found")
+			return
+		}
+		w.WriteHeader(204)
+	default:
+		errorOut(w, 405, "method not allowed")
+	}
+}
+func (h *Handler) schedules(w http.ResponseWriter, r *http.Request, path []string) {
+	if len(path) == 0 {
+		switch r.Method {
+		case "GET":
+			jsonOut(w, 200, h.svc.DB.ListSchedules())
+		case "POST":
+			var j model.Schedule
+			if !decode(w, r, &j) {
+				return
+			}
+			j.ID = ""
+			v, err := h.svc.DB.PutSchedule(j)
+			if err != nil {
+				errorOut(w, 400, err.Error())
+				return
+			}
+			jsonOut(w, 201, v)
+		default:
+			errorOut(w, 405, "method not allowed")
+		}
+		return
+	}
+	id := path[0]
+	if len(path) == 2 && path[1] == "run" {
+		if r.Method != "POST" {
+			errorOut(w, 405, "method not allowed")
+			return
+		}
+		j, ok := h.svc.DB.GetSchedule(id)
+		if !ok {
+			errorOut(w, 404, "schedule not found")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+		defer cancel()
+		jpeg, key, err := h.svc.CaptureSaved(ctx, j.CameraID, true, "manual-schedule", j.ID)
+		if err != nil {
+			errorOut(w, 502, err.Error())
+			return
+		}
+		jsonOut(w, 200, map[string]any{"object_key": key, "bytes": len(jpeg)})
+		return
+	}
+	if len(path) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case "PUT":
+		if _, ok := h.svc.DB.GetSchedule(id); !ok {
+			errorOut(w, 404, "schedule not found")
+			return
+		}
+		var j model.Schedule
+		if !decode(w, r, &j) {
+			return
+		}
+		j.ID = id
+		v, err := h.svc.DB.PutSchedule(j)
+		if err != nil {
+			errorOut(w, 400, err.Error())
+			return
+		}
+		jsonOut(w, 200, v)
+	case "DELETE":
+		if err := h.svc.DB.DeleteSchedule(id); err != nil {
+			errorOut(w, 404, "schedule not found")
+			return
+		}
+		w.WriteHeader(204)
+	default:
+		errorOut(w, 405, "method not allowed")
+	}
+}
+func (h *Handler) storage(w http.ResponseWriter, r *http.Request, path []string) {
+	if len(path) > 0 {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case "GET":
+		jsonOut(w, 200, h.svc.DB.PublicStorage())
+	case "PUT":
+		var s model.Storage
+		if !decode(w, r, &s) {
+			return
+		}
+		v, err := h.svc.DB.PutStorage(s)
+		if err != nil {
+			errorOut(w, 400, err.Error())
+			return
+		}
+		jsonOut(w, 200, v)
+	default:
+		errorOut(w, 405, "method not allowed")
+	}
+}
+func (h *Handler) directCapture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		errorOut(w, 405, "method not allowed")
+		return
+	}
+	var data struct {
+		model.Camera
+		Upload bool `json:"upload"`
+	}
+	if !decode(w, r, &data) {
+		return
+	}
+	data.Camera.ID = ""
+	data.Camera.Enabled = true
+	if data.Camera.Name == "" {
+		data.Camera.Name = "ad-hoc"
+	}
+	if err := model.ValidateCamera(&data.Camera); err != nil {
+		errorOut(w, 400, err.Error())
+		return
+	}
+	if data.Password == "" {
+		errorOut(w, 400, "password required")
+		return
+	}
+	h.respondCapture(w, r, func(ctx context.Context) ([]byte, string, error) {
+		return h.svc.Capture(ctx, data.Camera, data.Upload, "api", "")
+	})
+}
+func (h *Handler) respondCapture(w http.ResponseWriter, r *http.Request, fn func(context.Context) ([]byte, string, error)) {
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+	jpeg, key, err := fn(ctx)
+	if err != nil {
+		errorOut(w, 502, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if key != "" {
+		w.Header().Set("X-OSS-Object-Key", key)
+	}
+	w.WriteHeader(200)
+	w.Write(jpeg)
+}
