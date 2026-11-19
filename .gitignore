@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+data/
+*.exe
+*.log
+snapshot-server
+.DS_Store
+.idea/
+.vscode/
