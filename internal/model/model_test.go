@@ -17,11 +17,7 @@ func TestDueSlot(t *testing.T) {
 		t.Fatal("duplicate daily snapshot")
 	}
 	once := Schedule{Kind: "once", RunAt: now.Add(-time.Hour).Format(time.RFC3339), Enabled: true}
-	if _, due = DueSlot(once, now); !due {
-		t.Fatal("missed once")
-	}
-	once.LastSlot = "once:done"
 	if _, due = DueSlot(once, now); due {
-		t.Fatal("once ran again")
+		t.Fatal("legacy one-off plan must not execute")
 	}
 }

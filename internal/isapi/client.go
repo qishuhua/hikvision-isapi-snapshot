@@ -7,11 +7,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,43 +41,14 @@ func (c *Client) Capture(ctx context.Context, camera model.Camera) ([]byte, erro
 	if camera.EndpointMode == "proxy" {
 		path = "/ISAPI/ContentMgmt/StreamingProxy/channels/" + camera.ChannelID + "/picture"
 	}
-	target := camera.BaseURL + path
-	request := func(auth string) (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "image/jpeg")
-		if auth != "" {
-			req.Header.Set("Authorization", auth)
-		}
-		return c.http.Do(req)
+	if camera.Width > 0 {
+		path += fmt.Sprintf("?videoResolutionWidth=%d&videoResolutionHeight=%d", camera.Width, camera.Height)
 	}
-	resp, err := request("")
+	resp, err := c.get(ctx, camera, path)
 	if err != nil {
-		return nil, fmt.Errorf("camera request: %w", err)
+		return nil, err
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		challenges := resp.Header.Values("WWW-Authenticate")
-		resp.Body.Close()
-		var hdr string
-		for _, ch := range challenges {
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ch)), "digest ") {
-				hdr, err = digestHeader(ch, http.MethodGet, path, camera.Username, camera.Password)
-				if err != nil {
-					return nil, fmt.Errorf("digest: %w", err)
-				}
-				break
-			}
-		}
-		if hdr == "" {
-			return nil, errors.New("camera did not offer supported Digest authentication")
-		}
-		resp, err = request(hdr)
-		if err != nil {
-			return nil, fmt.Errorf("authenticated camera request: %w", err)
-		}
-	}
+
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -92,6 +65,135 @@ func (c *Client) Capture(ctx context.Context, camera model.Camera) ([]byte, erro
 		return nil, errors.New("camera returned non-JPEG data (check channel ID and endpoint mode)")
 	}
 	return b, nil
+}
+
+func (c *Client) get(ctx context.Context, camera model.Camera, path string) (*http.Response, error) {
+	request := func(auth string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, camera.BaseURL+path, nil)
+		if err != nil {
+			return nil, err
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		return c.http.Do(req)
+	}
+	resp, err := request("")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return resp, nil
+	}
+	challenges := resp.Header.Values("WWW-Authenticate")
+	resp.Body.Close()
+	for _, ch := range challenges {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ch)), "digest ") {
+			hdr, err := digestHeader(ch, http.MethodGet, path, camera.Username, camera.Password)
+			if err != nil {
+				return nil, err
+			}
+			return request(hdr)
+		}
+	}
+	return nil, errors.New("camera did not offer supported Digest authentication")
+}
+
+type Channel struct {
+	ID   string
+	Name string
+}
+
+func (c *Client) OnlineChannels(ctx context.Context, camera model.Camera) ([]Channel, error) {
+	read := func(path string, dst any) error {
+		resp, err := c.get(ctx, camera, path)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("channel query HTTP %d", resp.StatusCode)
+		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+		if err != nil {
+			return err
+		}
+		if len(b) > 4<<20 {
+			return errors.New("channel response too large")
+		}
+		return xml.Unmarshal(b, dst)
+	}
+	var names struct {
+		XMLName xml.Name
+		Items   []struct {
+			ID   int    `xml:"id"`
+			Name string `xml:"name"`
+		} `xml:"InputProxyChannel"`
+	}
+	if err := read("/ISAPI/ContentMgmt/InputProxy/channels", &names); err != nil {
+		return nil, err
+	}
+	if names.XMLName.Local != "InputProxyChannelList" {
+		return nil, errors.New("unexpected channel list")
+	}
+	var statuses struct {
+		XMLName xml.Name
+		Items   []struct {
+			ID      int    `xml:"id"`
+			Online  string `xml:"online"`
+			Streams []int  `xml:"streamingProxyChannelIdList>streamingProxyChannelId"`
+		} `xml:"InputProxyChannelStatus"`
+	}
+	if err := read("/ISAPI/ContentMgmt/InputProxy/channels/status", &statuses); err != nil {
+		return nil, err
+	}
+	if statuses.XMLName.Local != "InputProxyChannelStatusList" {
+		return nil, errors.New("unexpected channel status list")
+	}
+	nameMap := map[int]string{}
+	for _, n := range names.Items {
+		nameMap[n.ID] = strings.TrimSpace(n.Name)
+	}
+	allowed := map[string]bool{}
+	for _, id := range strings.Split(camera.Channels, ",") {
+		allowed[strings.TrimSpace(id)] = true
+	}
+	var out []Channel
+	seen := map[string]bool{}
+	for _, st := range statuses.Items {
+		if st.ID <= 0 || !(strings.EqualFold(strings.TrimSpace(st.Online), "true") || strings.TrimSpace(st.Online) == "1") {
+			continue
+		}
+		ids := st.Streams
+		if len(ids) == 0 {
+			ids = []int{st.ID*100 + 1}
+		}
+		if camera.Channels == "all" {
+			ids = ids[:1]
+		} else {
+			ids = nil
+			for id := range allowed {
+				n, _ := strconv.Atoi(id)
+				matches := n/100 == st.ID
+				for _, stream := range st.Streams {
+					if stream == n {
+						matches = true
+					}
+				}
+				if matches {
+					ids = append(ids, n)
+				}
+			}
+		}
+		for _, id := range ids {
+			key := strconv.Itoa(id)
+			if id > 0 && !seen[key] {
+				seen[key] = true
+				out = append(out, Channel{ID: key, Name: nameMap[st.ID]})
+			}
+		}
+	}
+	return out, nil
 }
 
 // parseDigestChallenge handles commas inside quoted parameter values.

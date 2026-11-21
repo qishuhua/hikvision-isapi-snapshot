@@ -25,11 +25,9 @@ func getenv(k, fallback string) string {
 	return v
 }
 func main() {
-	admin := os.Getenv("ADMIN_USER")
-	password := os.Getenv("ADMIN_PASSWORD")
 	key := os.Getenv("DATA_ENCRYPTION_KEY")
-	if admin == "" || password == "" || key == "" {
-		slog.Error("missing ADMIN_USER, ADMIN_PASSWORD or DATA_ENCRYPTION_KEY")
+	if key == "" {
+		slog.Error("missing DATA_ENCRYPTION_KEY")
 		os.Exit(1)
 	}
 	db, err := store.New(getenv("DATA_PATH", "./data/state.json"), key)
@@ -46,8 +44,8 @@ func main() {
 	defer stop()
 	go scheduler.New(svc, max).Run(ctx)
 	server := &http.Server{
-		Addr: getenv("HTTP_ADDR", ":8080"), Handler: httpapi.New(svc, admin, password),
-		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 45 * time.Second, IdleTimeout: 60 * time.Second,
+		Addr: getenv("HTTP_ADDR", "127.0.0.1:8080"), Handler: httpapi.New(svc),
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 10 * time.Minute, IdleTimeout: 60 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()

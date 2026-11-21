@@ -203,8 +203,25 @@ func (d *DB) DeleteCamera(id string) error {
 	}
 	delete(d.state.Cameras, id)
 	for k, j := range d.state.Schedules {
-		if j.CameraID == id {
+		if len(j.Targets) == 0 {
+			if j.CameraID == id {
+				delete(d.state.Schedules, k)
+			}
+			continue
+		}
+		kept := make([]model.ScheduleTarget, 0, len(j.Targets))
+		for _, target := range j.Targets {
+			if target.CameraID != id {
+				kept = append(kept, target)
+			}
+		}
+		if len(kept) == 0 {
 			delete(d.state.Schedules, k)
+		} else {
+			j.Targets = kept
+			j.CameraID = ""
+			j.TargetChannels = ""
+			d.state.Schedules[k] = j
 		}
 	}
 	return d.saveLocked()
@@ -257,8 +274,17 @@ func (d *DB) PutSchedule(j model.Schedule) (model.Schedule, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.state.Cameras[j.CameraID]; !ok {
-		return model.Schedule{}, errors.New("camera_id does not exist")
+	for _, target := range j.EffectiveTargets() {
+		c, ok := d.state.Cameras[target.CameraID]
+		if !ok {
+			return model.Schedule{}, errors.New("camera_id does not exist")
+		}
+		if target.TargetChannels != "" && c.DeviceType != "nvr" {
+			return model.Schedule{}, errors.New("target_channels requires an NVR")
+		}
+		if len(j.Targets) > 0 && c.DeviceType == "nvr" && target.TargetChannels == "" {
+			return model.Schedule{}, errors.New("NVR target requires channels")
+		}
 	}
 	if j.ID == "" {
 		j.ID = NewID()
@@ -296,8 +322,14 @@ func (d *DB) ClaimDue(now time.Time, limit int) ([]model.Schedule, error) {
 			break
 		}
 		j := d.state.Schedules[id]
-		c, ok := d.state.Cameras[j.CameraID]
-		if !ok || !c.Enabled {
+		enabled := false
+		for _, target := range j.EffectiveTargets() {
+			if c, ok := d.state.Cameras[target.CameraID]; ok && c.Enabled {
+				enabled = true
+				break
+			}
+		}
+		if !enabled {
 			continue
 		}
 		slot, due := model.DueSlot(j, now)
@@ -305,9 +337,6 @@ func (d *DB) ClaimDue(now time.Time, limit int) ([]model.Schedule, error) {
 			continue
 		}
 		j.LastSlot = slot
-		if j.Kind == "once" {
-			j.Enabled = false
-		}
 		d.state.Schedules[id] = j
 		jobs = append(jobs, j)
 	}
