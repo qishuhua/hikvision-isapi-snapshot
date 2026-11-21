@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/qishuhua/hikvision-isapi-snapshot/internal/model"
@@ -22,6 +23,7 @@ func New(svc *service.Service, workers int) *Scheduler {
 }
 func (s *Scheduler) Run(ctx context.Context) {
 	queue := make(chan model.Schedule, s.workers*3)
+	var active sync.Map
 	for i := 0; i < s.workers; i++ {
 		go func() {
 			for {
@@ -29,13 +31,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case job := <-queue:
-					requestCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
-					_, key, err := s.svc.CaptureSaved(requestCtx, job.CameraID, true, "schedule", job.ID)
-					cancel()
+					count, err := s.svc.RunSchedule(ctx, job, "schedule")
+					active.Delete(job.ID)
 					if err != nil {
 						slog.Error("scheduled snapshot failed", "schedule_id", job.ID, "err", err)
 					} else {
-						slog.Info("scheduled snapshot uploaded", "schedule_id", job.ID, "object_key", key)
+						slog.Info("scheduled snapshot uploaded", "schedule_id", job.ID, "count", count)
 					}
 				}
 			}
@@ -55,6 +56,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 			for _, job := range jobs {
+				if _, loaded := active.LoadOrStore(job.ID, true); loaded {
+					continue
+				}
 				queue <- job
 			}
 		}

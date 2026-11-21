@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/qishuhua/hikvision-isapi-snapshot/internal/isapi"
@@ -14,10 +15,11 @@ import (
 )
 
 type Service struct {
-	DB        *store.DB
-	camera    *isapi.Client
-	oss       *oss.Client
-	semaphore chan struct{}
+	DB          *store.DB
+	camera      *isapi.Client
+	oss         *oss.Client
+	semaphore   chan struct{}
+	deviceLocks sync.Map
 }
 
 func New(db *store.DB, maxConcurrent int) *Service {
@@ -54,7 +56,16 @@ func (s *Service) Capture(ctx context.Context, c model.Camera, upload bool, sour
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
 	}
-	jpeg, err = s.camera.Capture(ctx, c)
+	lockValue, _ := s.deviceLocks.LoadOrStore(strings.ToLower(c.BaseURL), &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	for attempt := 0; attempt <= c.RetryCount; attempt++ {
+		jpeg, err = s.camera.Capture(ctx, c)
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+	}
+	lock.Unlock()
 	if err != nil {
 		return nil, "", fmt.Errorf("ISAPI capture: %w", err)
 	}
@@ -87,4 +98,106 @@ func (s *Service) CaptureSaved(ctx context.Context, id string, upload bool, sour
 		return nil, "", fmt.Errorf("camera not found")
 	}
 	return s.Capture(ctx, c, upload, source, scheduleID)
+}
+
+func (s *Service) RunSchedule(ctx context.Context, j model.Schedule, source string) (int, error) {
+	total := 0
+	var failures []string
+	for _, target := range j.EffectiveTargets() {
+		camera, ok := s.DB.GetCamera(target.CameraID)
+		if !ok {
+			failures = append(failures, target.CameraID+": device not found")
+			continue
+		}
+		if !camera.Enabled {
+			continue
+		}
+		single := j
+		single.CameraID = target.CameraID
+		single.TargetChannels = target.TargetChannels
+		single.Targets = nil
+		count, err := s.runScheduleTarget(ctx, single, source)
+		total += count
+		if err != nil {
+			failures = append(failures, camera.Name+": "+err.Error())
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if len(failures) > 0 {
+		return total, fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return total, nil
+}
+
+func (s *Service) runScheduleTarget(ctx context.Context, j model.Schedule, source string) (int, error) {
+	camera, ok := s.DB.GetCamera(j.CameraID)
+	if !ok {
+		return 0, fmt.Errorf("camera not found")
+	}
+	if j.TargetChannels != "" {
+		camera.Channels = j.TargetChannels
+		camera.EndpointMode = "streaming"
+	}
+	if camera.Channels == "" {
+		_, _, err := s.Capture(ctx, camera, true, source, j.ID)
+		if err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	lockValue, _ := s.deviceLocks.LoadOrStore(strings.ToLower(camera.BaseURL), &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	var channels []isapi.Channel
+	var err error
+	for attempt := 0; attempt <= camera.RetryCount; attempt++ {
+		channels, err = s.camera.OnlineChannels(ctx, camera)
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+	}
+	lock.Unlock()
+	if err != nil {
+		failure := fmt.Errorf("channel discovery: %w", err)
+		if saveErr := s.DB.AddRecord(model.CaptureRecord{ID: store.NewID(), CameraID: camera.ID, CameraName: camera.Name, ScheduleID: j.ID, Source: source, StartedAt: time.Now(), Status: "failed", Error: failure.Error()}); saveErr != nil {
+			slog.Error("record save failed", "err", saveErr)
+		}
+		return 0, failure
+	}
+	count := 0
+	var failures []string
+	for _, ch := range channels {
+		c := camera
+		c.ChannelID = ch.ID
+		c.Channels = ""
+		c.Name = camera.Name + "/" + ch.ID + "_" + ch.Name
+		if _, _, err := s.Capture(ctx, c, true, source, j.ID); err != nil {
+			failures = append(failures, ch.ID+": "+err.Error())
+		} else {
+			count++
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if len(failures) > 0 {
+		return count, fmt.Errorf("%s", strings.Join(failures, "; "))
+	}
+	return count, nil
+}
+
+func (s *Service) Discover(ctx context.Context, camera model.Camera, kind string) (isapi.Discovery, error) {
+	if err := model.ValidateCamera(&camera); err != nil {
+		return isapi.Discovery{}, err
+	}
+	if camera.Password == "" {
+		return isapi.Discovery{}, fmt.Errorf("camera password required")
+	}
+	lockValue, _ := s.deviceLocks.LoadOrStore(strings.ToLower(camera.BaseURL), &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.camera.Discover(ctx, camera, kind)
 }
